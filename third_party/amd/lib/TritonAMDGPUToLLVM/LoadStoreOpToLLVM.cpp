@@ -51,7 +51,7 @@ Value redundantDataMask(Type valueTy, ConversionPatternRewriter &rewriter,
     } else {
       warpOrder = triton::gpu::getWarpOrder(tensorTy);
     }
-    auto shapePerCTATile = triton::gpu::getShapePerCTATile(layout);
+    auto shapePerCTATile = triton::gpu::getShapePerCTATile(tensorTy);
     Value warpSize = b.i32_val(triton::gpu::getWarpSize(layout));
     Value laneId = b.urem(tid, warpSize);
     Value warpId = b.udiv(tid, warpSize);

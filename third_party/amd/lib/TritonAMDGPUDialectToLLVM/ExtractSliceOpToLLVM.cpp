@@ -70,7 +70,7 @@ struct ExtractSliceOpConversion
     auto order = triton::gpu::getOrder(srcTy);
 
     // Calculate valid total number of workers in each dimension
-    auto shapePerCTATile = triton::gpu::getShapePerCTATile(srcLayout);
+    auto shapePerCTATile = triton::gpu::getShapePerCTATile(srcTy);
     shapePerCTATile[0] =
         std::min(static_cast<unsigned>(srcShape[0]), shapePerCTATile[0]);
     shapePerCTATile[1] =

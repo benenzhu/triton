@@ -83,6 +83,7 @@ struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
 };
 
 // Convert a distributed layout to a linear encoding
+LinearEncodingAttr toLinearEncoding(RankedTensorType type);
 LinearEncodingAttr toLinearEncoding(Attribute layout, ArrayRef<int64_t> shape);
 
 unsigned getTotalElemsPerThread(Type type);
@@ -181,7 +182,7 @@ SmallVector<unsigned> getCTAOrder(Attribute layout);
  * (3) In the implementation of emitIndices, ShapePerCTATile will
  *     be replicated or wrapped to fit ShapePerCTA.
  */
-SmallVector<unsigned> getShapePerCTATile(Attribute layout);
+SmallVector<unsigned> getShapePerCTATile(RankedTensorType layout);
 
 // Returns the "logical" shape per CTA
 SmallVector<int64_t> getShapePerCTA(ArrayRef<unsigned> CTASplitNum,

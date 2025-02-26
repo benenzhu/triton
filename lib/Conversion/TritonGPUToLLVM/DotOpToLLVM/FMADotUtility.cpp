@@ -107,7 +107,7 @@ LogicalResult parametricConvertFMADot(DotOp op, DotOp::Adaptor adaptor,
       expandMatrixShapeWithBatch(ArrayRef(getSizePerThread(dLayout)));
   auto numElemsPerThread = product(sizePerThread);
   auto shapePerCTATile =
-      expandMatrixShapeWithBatch(ArrayRef(getShapePerCTATile(dLayout)));
+      expandMatrixShapeWithBatch(ArrayRef(getShapePerCTATile(dTensorTy)));
 
   unsigned K = aShapePerCTA[2];
 
