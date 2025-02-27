@@ -240,6 +240,8 @@ llvm::SmallVector<T> expandMatrixShapeWithBatch(llvm::ArrayRef<T> s);
 llvm::SmallVector<unsigned>
 expandMatrixOrderWithBatch(llvm::ArrayRef<unsigned> o);
 
+// Legacy functions to be removed
+SmallVector<unsigned> legacyGetShapePerCTATile(Attribute layout);
 } // namespace mlir::triton::gpu
 
 #endif // TRITON_DIALECT_TRITONGPU_IR_DIALECT_H_

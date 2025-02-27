@@ -3533,3 +3533,31 @@ int triton::gpu::lookupNumWarps(Operation *op) {
   }
   return *numWarps;
 }
+
+// Legacy functions to be removed
+namespace mlir::triton::gpu {
+SmallVector<unsigned> legacyGetShapePerCTATile(Attribute layout) {
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    auto sizePerThread = distributedLayout.getSizePerThread();
+    auto threadsPerWarp = distributedLayout.getThreadsPerWarp();
+    // ThreadsPerWarp does not align with this function for slice layout
+    if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(layout)) {
+      threadsPerWarp = getThreadsPerWarp(sliceLayout.getParent());
+      threadsPerWarp.erase(threadsPerWarp.begin() + sliceLayout.getDim());
+    }
+    auto warpsPerCTA = distributedLayout.getWarpsPerCTA();
+    assert(sizePerThread.size() == threadsPerWarp.size() &&
+           sizePerThread.size() == warpsPerCTA.size());
+    SmallVector<unsigned> shape;
+    for (auto [size, thread, warp] :
+         llvm::zip(sizePerThread, threadsPerWarp, warpsPerCTA)) {
+      shape.push_back(size * thread * warp);
+    }
+    return shape;
+  } else {
+    llvm::report_fatal_error("getShapePerCTATile not implemented");
+    return SmallVector<unsigned>();
+  }
+}
+} // namespace mlir::triton::gpu
