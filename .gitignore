@@ -94,3 +94,5 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
+.specstory/.project.json
+.specstory/.what-is-this.md
