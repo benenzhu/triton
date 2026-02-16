@@ -96,3 +96,7 @@ docs/sg_execution_times.rst
 .DS_Store
 .specstory/.project.json
 .specstory/.what-is-this.md
+docs/triton-lower-learning/01-python-to-ttir.md
+
+pipeline.txt
+pipeline.annotated.txt

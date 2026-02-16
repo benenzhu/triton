@@ -1,0 +1,1 @@
+python3 /root/compiler-explorer-triton/etc/scripts/triton_wrapper.py mi355gemm_learn.py --output_file /tmp/output.asm --opt_pipeline_file /tmp/pipeline.txt --backend hip --arch gfx950 --warp_size 64
