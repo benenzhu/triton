@@ -51,7 +51,7 @@ tt.func public @matmul_kernel(
 - `tl.constexpr` 参数（BLOCK_M, BLOCK_N, BLOCK_K, EVEN_K, NUM_XCDS 等）**不出现在函数签名中**，它们在 Python 前端被内联为常量
 - 指针类型为 `!tt.ptr<bf16>`，附带 `tt.divisibility = 16`（来自 PyTorch tensor 的 16 字节对齐）
 - 所有 stride 里 `stride_ak=1, stride_bk=1, stride_cn=1` 因为是连续维度，前端直接替换为常量 `1`，不再作为参数传入
-- `tt.pointer_range = 32` 表示指针偏移用 32 位整数即可
+- `tt.pointer_range = 32` — 该指针的存储总量不超过 2GB（`2^31 - 1` 字节）。这是 AMD 后端在 kernel 特化阶段检测到 tensor 的 `untyped_storage().size() <= 2^31-1` 时自动添加的（见 `HIPBackend.get_tensor_specialization` 中的 `"S"` 标记）。后续 `ConvertToBufferOps` pass 会利用此属性将普通的 `global_load/store` 提升为 AMD 的 `buffer_load/store` 指令——buffer 指令使用 32 位偏移寻址，比 64 位 flat 指令更高效（少用寄存器，且硬件路径更快）。如果 tensor 超过 2GB，该属性不会被添加，编译器会退回到 64 位寻址
 
 ## tl.assume → llvm.intr.assume
 
@@ -61,13 +61,18 @@ tl.assume(stride_ak > 0)  # stride_ak=1, constexpr
 ```
 
 ```mlir
-%0 = arith.cmpi sgt, %stride_am, %c0_i32 : i32    // stride_am > 0
+// arith.cmpi: 整数比较指令（compare integer）
+//   sgt = signed greater than（有符号大于）
+//   其他谓词: slt(<), sle(<=), sge(>=), eq(==), ne(!=)
+//   %stride_am, %c0_i32 是两个 i32 操作数
+//   结果 %0 是 i1（1-bit 布尔值）
+%0 = arith.cmpi sgt, %stride_am, %c0_i32 : i32    // %0 = (stride_am > 0)
 llvm.intr.assume %0 : i1                            // 告诉编译器这是恒真的
 
 llvm.intr.assume %true : i1                         // stride_ak=1 > 0, 编译期已知为 true
 ```
 
-`tl.assume` 直接变成 `llvm.intr.assume`。当 stride 是 constexpr 时（如 `stride_ak=1`），比较结果编译期已知为 `true`。
+`tl.assume` 直接变成 `llvm.intr.assume`。当 stride 是 constexpr 时（如 `stride_ak=1`），前端直接算出 `1 > 0 = true`，省掉了 `cmpi` 指令。
 
 ## tl.program_id → tt.get_program_id
 
