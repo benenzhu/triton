@@ -480,3 +480,417 @@ if ((gloadSize < 2 || lLoadOps.size() < 2 || dotSize != 1)) {
 | `amdg.cond_barrier %pred` | 条件 barrier（部分 warp 同步） | TritonAMDGPU dialect |
 | `amdg.memory_counter_wait ds(N)` | 等待内存计数器 | TritonAMDGPU dialect |
 | `ttg.MemDescSubsliceOp` | 从 memdesc 切片（dot slicing 用） | TritonGPU dialect |
+
+## 单测解析
+
+测试文件通过 `triton-opt` 运行 `--tritonamdgpu-block-pingpong` pass，用 FileCheck 验证变换后的 IR。
+
+```bash
+# 运行命令（from RUN lines）
+triton-opt test.mlir -split-input-file --tritonamdgpu-block-pingpong="num-stages=2" | FileCheck %s
+triton-opt test.mlir -split-input-file --tritonamdgpu-block-pingpong="num-stages=4" | FileCheck %s  # chained dots
+```
+
+### Test 1: pingpong_small — One PP Cluster
+
+**文件**: `amd-block-pingpong.mlir`
+
+**配置**: `numWarps=4`, tile=128×128, K=64, f16, `numStages=2`
+
+**输入循环体**（简化）：
+```mlir
+scf.for ... {
+    %a_next = tt.addptr %a_ptrs, %cst_64          // 指针步进
+    %a_data = tt.load %a_next                      // global load A
+    %b_next = tt.addptr %b_ptrs, %cst_64
+    %b_data = tt.load %b_next                      // global load B
+    %a_ll = ttg.local_load %a_buf                  // local load A (LDS→reg)
+    %b_ll = ttg.local_load %b_buf                  // local load B
+    %neg = arith.negf %b_ll                        // 额外计算（取反）
+    %acc = tt.dot %a_ll, %neg, %prev_acc           // MFMA dot
+    ttg.local_store %a_data, %a_new_buf            // local store A
+    ttg.local_store %b_data, %b_new_buf            // local store B
+    scf.yield ...
+}
+```
+
+**变换后**（FileCheck 验证）：
+```mlir
+// Memory Cluster: global/local load 交错排列
+ttg.local_load           // local load A（先于 global load）
+rocdl.s.setprio 1        // 提高优先级
+tt.load                  // global load A
+rocdl.sched.barrier      // 阻止重排
+ttg.local_load           // local load B
+rocdl.s.setprio 0        // 降低优先级
+tt.load                  // global load B
+
+// Dot Cluster: setprio 保护
+rocdl.sched.barrier
+rocdl.s.setprio 1        // dot 开始前提高优先级
+tt.dot                   // MFMA 计算
+rocdl.s.setprio 0        // dot 结束后降低优先级
+```
+
+**要点**：
+- `numWarps=4` → 不需要 `cond_barrier`（跨 block warp 交错，天然独立）
+- 不切分 dot，只重排操作 + 插入 `s_setprio`
+- `arith.negf` 等额外计算保持原位，pass 不移动非 load/dot 的 op
+
+### Test 2: pingpong_large — Four PP Clusters
+
+**配置**: `numWarps=8`, tile=256×256, K=64, f16, `numStages=2`
+
+tileSize = 256×256×64×16 = 67,108,864 ≥ largeTile → 选择 Four PP Clusters
+
+**输入循环体**（简化）：
+```mlir
+scf.for ... {
+    %a_data = tt.load ...                          // global load A
+    %b_data = tt.load ...                          // global load B
+    %a_ll = ttg.local_load %a_buf                  // local load A (256×64)
+    %b_ll = ttg.local_load %b_buf                  // local load B (64×256)
+    %acc = tt.dot %a_ll, %b_ll, %prev_acc          // 一个大 dot
+    ttg.local_store %a_data, ...                   // local store A
+    ttg.local_store %b_data, ...                   // local store B
+    scf.yield ...
+}
+```
+
+**变换后**（FileCheck 验证）：
+
+```mlir
+// 循环前: 非对称同步
+ttg.barrier local                          // 全局同步
+%idx = rocdl.workitem.id.x
+%warp = arith.divsi %idx, 256
+%warpLow = arith.cmpi eq, %warp, 0
+%warpHigh = arith.cmpi ne, %warp, 0
+amdg.cond_barrier %warpHigh               // 后半 warp 等待
+
+scf.for ... {
+    // dot 被切成 4 份，local_load 也对应切成 4 组
+
+    // mem0: global load A + sliced local load (1/4)
+    tt.load                                // global load A
+    %sliceA0 = ttg.local_load             // local load A slice 0
+    %sliceB0 = ttg.local_load             // local load B slice 0
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // dot0
+    rocdl.s.setprio 1
+    %dot0 = tt.dot %sliceA0, %sliceB0     // dot (1/4)
+    rocdl.s.setprio 0
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // mem1: global load B + sliced local load (2/4)
+    tt.load                                // global load B
+    %sliceA1 = ttg.local_load
+    %sliceB1 = ttg.local_load
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // dot1
+    rocdl.s.setprio 1
+    %dot1 = tt.dot %sliceA1, %sliceB1, %dot0   // dot (2/4), 累加
+    rocdl.s.setprio 0
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // mem2: sliced local load (3/4, 4/4)
+    %sliceA2 = ttg.local_load
+    %sliceB2 = ttg.local_load
+    %sliceA3 = ttg.local_load
+    %sliceB3 = ttg.local_load
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // dot2
+    rocdl.s.setprio 1
+    %dot2 = tt.dot %sliceA2, %sliceB2, %dot1   // dot (3/4)
+    rocdl.s.setprio 0
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // mem3: local store
+    ttg.local_store
+    ttg.local_store
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // dot3
+    rocdl.s.setprio 1
+    tt.dot %sliceA3, %sliceB3, %dot2            // dot (4/4)
+    rocdl.s.setprio 0
+    ttg.barrier local + rocdl.sched.barrier 0   // 循环末尾 barrier
+
+    scf.yield ...
+}
+amdg.cond_barrier %warpLow                // 前半 warp 等待后半追上
+```
+
+**要点**：
+- 原始的 1 个 `tt.dot` 被 `sliceDot()` 切成 4 个，每个消费 K 维度的 1/4
+- 原始的 2 个 `ttg.local_load` 被切成 8 个 `ttg.local_load`（每个通过 `MemDescSubsliceOp` 访问 K 维的一个 slice）
+- 4 个 dot 通过累加器串联：`dot0 → dot1(+dot0) → dot2(+dot1) → dot3(+dot2)`
+- 循环前后有 `cond_barrier` 实现非对称同步
+
+### Test 3: pingpong_medium — Two PP Clusters
+
+**配置**: `numWarps=8`, tile=256×128, K=64, f16, `numStages=2`
+
+tileSize = 256×128×64×16 = 33,554,432 == mediumTile → 选择 Two PP Clusters
+
+**变换后**（FileCheck 验证）：
+
+```mlir
+// 循环前: 非对称同步（同 pingpong_large）
+amdg.cond_barrier %warpHigh
+
+scf.for ... {
+    // Memory Cluster #0: local load 和 global load 交错
+    %sliceA0 = ttg.local_load             // local load A slice 0
+    %sliceB0 = ttg.local_load             // local load B slice 0
+    rocdl.sched.barrier 0
+    tt.load                                // global load A
+    rocdl.sched.barrier 0
+    %sliceA1 = ttg.local_load             // local load A slice 1
+    %sliceB1 = ttg.local_load             // local load B slice 1
+    rocdl.sched.barrier 0
+    tt.load                                // global load B
+    rocdl.s.barrier                        // s_barrier（非 ttg.barrier）
+    rocdl.sched.barrier 0
+
+    // Dot Cluster #0
+    rocdl.s.setprio 1
+    %dot0 = tt.dot %sliceA0, %sliceB0
+    rocdl.s.setprio 0
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // Memory Cluster #1: local store
+    ttg.local_store
+    ttg.local_store
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    // Dot Cluster #1
+    rocdl.s.setprio 1
+    %dot1 = tt.dot %sliceA1, %sliceB1, %dot0
+    rocdl.s.setprio 0
+    ttg.barrier local + rocdl.sched.barrier 0
+
+    scf.yield ...
+}
+amdg.cond_barrier %warpLow
+```
+
+**与 Four PP Clusters 的区别**：
+- dot 切 2 份而非 4 份
+- Memory Cluster #0 更紧凑，交错了所有 local load 和 global load
+- 使用 `rocdl.s.barrier`（直接 `s_barrier`）而非 `ttg.barrier local`
+
+### Test 4: pingpong_medium_cast — 被拒绝（类型不匹配）
+
+**配置**: `numWarps=8`, tile=256×128, K=64, `numStages=2`
+
+**特殊之处**: B 矩阵的 shared memory 类型是 `i16`（而非 `f16`），循环中有 `tt.bitcast` 将 `i16` 转为 `f16`。
+
+```mlir
+%cast2 = tt.bitcast %29 : tensor<64x128xf16> -> tensor<64x128xi16>   // store 前转 i16
+%31 = ttg.local_load %arg11 : !ttg.memdesc<64x128xi16, ...>          // load 出 i16
+%cast = tt.bitcast %31 : tensor<64x128xi16> -> tensor<64x128xf16>    // dot 前转 f16
+```
+
+**FileCheck 验证**：
+```
+// CHECK-LABEL: pingpong_medium_cast
+// CHECK-COUNT-2: local_load
+// CHECK-NOT: setprio       ← 没有 setprio → pass 没生效
+// CHECK-NOT: barrier        ← 没有 barrier
+```
+
+**被拒原因**：`local_load` 的结果类型是 `i16`，但 `determineDotMemoryOps()` 通过 `findClosestPredOps` 追踪 dot 的输入 → `tt.bitcast` → `local_load`。由于 `bitcast` 不是 `LocalLoadOp`，追踪链断裂，无法关联 local_load 到 dot，最终 `dotLocalLoads` 集合为空，不满足 `lLoadOps.size() >= 2` 条件。
+
+### Test 5: pingpong_reject — 被拒绝（tile 太小 + kWidth 冲突）
+
+**配置**: `numWarps=8`, tile=256×256, **K=16**, f16, `numStages=2`, `kWidth=8`
+
+```
+// CHECK-LABEL: pingpong_reject
+// CHECK-NOT: setprio
+// CHECK-NOT: barrier
+```
+
+**被拒原因**：tile 256×256 看似 large，但 BLOCK_K=16。tileSize = 256×256×16×16 = 16,777,216 = smallTile，不满足 `numWarps=8` 下的 medium/large 条件。且 `intShape=[16,16]` + `kWidth=8` 触发了寄存器溢出保护：
+
+```cpp
+if (intShape[0] == 16 && intShape[1] == 16 && kWidth == 8) {
+    LDBG("Reached known register spilling case, skip pingpong scheduling");
+    return;
+}
+```
+
+### Test 6: pingpong_small_prologue_load — 被拒绝（额外 load in scf.if）
+
+**配置**: `numWarps=4`, tile=128×128, K=64, f16
+
+**特殊之处**: 循环体开头有 `scf.if`，里面包含额外的 `tt.load`、`local_alloc`、`local_store`、`local_load`——模拟 prologue 阶段的条件加载。
+
+```
+// CHECK-LABEL: pingpong_small_prologue_load
+// CHECK-NOT: setprio
+```
+
+**被拒原因**：`scf.if` 内部的 `tt.load` 被收集到 `gLoadOps` 中，加上外部的 2 个 `tt.load`，总共 3 个 global load。但 `determineDotMemoryOps` 只关联到 dot 的 2 个，额外的 1 个非 dot 相关的 load 触发了 `estimateNonDotMemoryImpact != 0` 检查，被拒绝。
+
+### Test 7: pingpong_medium_dependency / pingpong_large_dependency — 带 epilogue 计算
+
+**配置**: tile=256×128（medium）/ 256×256（large）, `numWarps=8`
+
+**特殊之处**: dot 后有 `arith.addf`（模拟 persistent GEMM 的 epilogue），local_store 依赖 dot 的输出。
+
+```mlir
+%32 = tt.dot %30, %31, %arg6    // dot
+%33 = arith.addf %32, %cst_2    // ← epilogue 计算，依赖 dot 结果
+// ... local_store 依赖 %33
+```
+
+**FileCheck 验证**：变换**成功**生效，输出与对应基本模式一致。`moveOpAndPredecessorsUpSameBlock()` 正确处理了 local_store 对 dot 输出的依赖——将 local_store 及其前驱（`arith.addf`）一起移动。
+
+### Test 8: pingpong_small_load_reorder — local load 在 global load 之前
+
+**配置**: `numWarps=4`, tile=128×128, K=64
+
+**特殊之处**: 输入 IR 中 `local_load` 出现在 `global_load` 之前（与 `pingpong_small` 的顺序相反）。
+
+```mlir
+// 注意顺序：先 local_load，后 global_load
+%26 = ttg.local_load %arg10     // local load A — 先出现
+%27 = ttg.local_load %arg11     // local load B
+%29 = tt.load %28               // global load A — 后出现
+%31 = tt.load %30               // global load B
+%32 = tt.dot %26, %27, %arg6
+```
+
+**FileCheck 验证**：变换**成功**，输出与 `pingpong_small` 相同。说明 pass 对输入 IR 中 load 的相对顺序是鲁棒的。
+
+### Test 9: pingpong_small_local_load_dep — local_load 有后续计算
+
+**配置**: `numWarps=4`, tile=128×128, K=64
+
+**特殊之处**: `local_load` 的结果经过 `arith.addf` 才传给 dot（而非直接传）。
+
+```mlir
+%30 = ttg.local_load %arg10
+%31 = arith.addf %30, %cst_2    // ← local_load 后有额外计算
+%32 = ttg.local_load %arg11
+%33 = tt.dot %31, %32, %arg6    // dot 用的是 %31（addf 结果）
+```
+
+**FileCheck 验证**：变换**成功**，输出与 `pingpong_small` 相同。`findClosestPredOps` 能穿过 `arith.addf` 追踪到 `local_load`。
+
+### Test 10: chained_dots_async_loads — ChainedDot + async copy
+
+**文件**: `amd-block-pingpong-chained-dots.mlir`
+
+**配置**: `numWarps=4`, `numStages=4`, gfx950, 2 个 dot ops, async copy
+
+**输入循环体**（简化）：
+```mlir
+scf.for ... {
+    %dot0 = tt.dot %A, %arg17, %acc0          // dot 0
+    %wait0 = ttg.async_wait %token0            // 等待 async copy
+    %ll0 = ttg.local_load %buf0 token %wait0   // local load
+    %copy0 = ttg.async_copy_global_to_local ...// 发起新 async copy
+    %commit0 = ttg.async_commit_group ...
+    %dot1 = tt.dot %A, %ll0, %acc1            // dot 1
+    %wait1 = ttg.async_wait %token1
+    %ll1 = ttg.local_load %buf1 token %wait1
+    %copy1 = ttg.async_copy_global_to_local ...
+    %commit1 = ttg.async_commit_group ...
+    scf.yield ...
+}
+```
+
+**变换后**（FileCheck 验证）：
+```mlir
+// 循环前: 非对称同步
+amdg.cond_barrier %warpHigh
+
+scf.for ... {
+    // Compute Cluster 1
+    rocdl.s.barrier
+    rocdl.sched.barrier 0
+    tt.dot                                     // dot 0
+
+    // Memory Cluster 1
+    rocdl.sched.barrier 0
+    ttg.async_wait
+    rocdl.s.setprio 1                          // memory cluster 高优先级！
+    rocdl.sched.barrier 0
+    ttg.local_load                             // 从 LDS 加载
+    ttg.async_copy_global_to_local             // 异步预取
+    ttg.async_commit_group
+
+    // Compute Cluster 2
+    rocdl.sched.barrier 0
+    rocdl.s.setprio 0                          // 降回低优先级
+    amdg.memory_counter_wait ds(0)             // s_waitcnt lgkmcnt(0)
+    rocdl.s.barrier
+    rocdl.sched.barrier 0
+    tt.dot                                     // dot 1
+
+    // Memory Cluster 2
+    rocdl.sched.barrier 0
+    ttg.async_wait
+    rocdl.s.setprio 1
+    rocdl.sched.barrier 0
+    ttg.local_load
+    ttg.async_copy_global_to_local
+    ttg.async_commit_group
+
+    // Loop End
+    rocdl.sched.barrier 0
+    rocdl.s.setprio 0
+    amdg.memory_counter_wait ds(0)
+    scf.yield
+}
+amdg.cond_barrier %warpLow
+```
+
+**要点**：
+- Memory cluster 优先级**高于** compute cluster（与其他模式相反）
+- `amdg.memory_counter_wait ds(0)` 放在 compute cluster 开头，确保 LDS 读完成
+- `s_barrier` 放在循环**开头**（compute cluster 1 之前），而非结尾
+
+### Test 11: chained_dots_tt_loads — ChainedDot + tt.load（非 async）
+
+**配置**: 同 Test 10，但用 `tt.load` + `ttg.local_store/load` 代替 `async_copy`
+
+**变换后的差异**：
+- Memory cluster 中出现 `ttg.local_store` → `ttg.local_load`（而非 `async_wait` → `local_load`）
+- `ttg.barrier local` 替代了 async_wait 后的 sched_barrier
+
+### Test 12/13: reject_chained_dots_empty_mem_cluster — ChainedDot 被拒
+
+**Test 12**: 两个 dot 之间没有 memory ops（`async_wait`、`local_store` 等），第一个 memory cluster 为空 → `findNextMemoryCluster` 返回同一个 op → 被拒
+
+**Test 13**: 只有一个 dot 后面有 memory ops，另一个没有 → `memoryClusterStartOps` 之一为 `nullptr` → 被拒
+
+```
+// CHECK-NOT: setprio
+// CHECK-NOT: barrier
+```
+
+### 测试用例汇总
+
+| 测试名 | 模式 | numWarps | tile | 结果 | 验证要点 |
+|--------|------|----------|------|------|----------|
+| `pingpong_small` | One PP | 4 | 128×128 | 生效 | setprio + load 重排 |
+| `pingpong_large` | Four PP | 8 | 256×256 | 生效 | dot 切 4 份 + cond_barrier |
+| `pingpong_medium` | Two PP | 8 | 256×128 | 生效 | dot 切 2 份 + s_barrier |
+| `pingpong_medium_cast` | - | 8 | 256×128 | 拒绝 | bitcast 断开追踪链 |
+| `pingpong_reject` | - | 8 | 256×256(K=16) | 拒绝 | 寄存器溢出保护 |
+| `pingpong_small_prologue_load` | - | 4 | 128×128 | 拒绝 | scf.if 内额外 load |
+| `pingpong_medium_dependency` | Two PP | 8 | 256×128 | 生效 | epilogue addf 依赖 |
+| `pingpong_large_dependency` | Four PP | 8 | 256×256 | 生效 | epilogue addf 依赖 |
+| `pingpong_small_load_reorder` | One PP | 4 | 128×128 | 生效 | local load 先于 global load |
+| `pingpong_small_local_load_dep` | One PP | 4 | 128×128 | 生效 | local_load 后有 addf |
+| `chained_dots_async_loads` | ChainedDot | 4 | 128×16 | 生效 | async copy + 高优先级 memory |
+| `chained_dots_tt_loads` | ChainedDot | 4 | 128×16 | 生效 | tt.load + local_store |
+| `reject_chained_dots_*` (×2) | - | 4 | 128×16 | 拒绝 | memory cluster 为空 |
+| `async_ns3_gemm` | TwoClusterLocalLoad | 8 | >64×64 | 生效 | numStages=3 + async copy |
