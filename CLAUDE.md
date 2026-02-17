@@ -150,6 +150,7 @@ Key variables for debugging (see `python/triton/knobs.py` and README for full li
 |------|------|
 | `mi355x_gemm.py` | 优化后的 GEMM kernel + benchmark（NT layout） |
 | `mi355gemm_learn.py` | 用于 pipeline 学习的简化版 kernel |
+| `mi355gemm_pingpong_learn.py` | 触发 BlockPingpong pass 的 GEMM kernel（128x128x64, num_stages=3） |
 | `annotate_pipeline.py` | 工具脚本：给 MLIR pipeline dump 标注 Python 源码行 |
 | `sweep_gemm.py` | 参数扫描脚本 |
 | `docs/triton-lower-learning/` | Triton lowering 学习笔记系列 |
@@ -196,7 +197,7 @@ sanitize_overflow=False  # 可安全关闭，减少编译时间
 
 ### Pingpong Pass 状态
 
-Pingpong scheduling (`third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp`) 默认在 gfx950 上开启，但**未在我们的 kernel 上生效**。原因：pipeline 后循环体有 2 个 `tt.dot` op（num_stages=2 展开），而 pingpong 要求恰好 1 个 dot。汇编中没有 `s_setprio` 或 `sched_barrier`。
+Pingpong scheduling (`third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp`) 默认在 gfx950 上开启，但**未在我们的 kernel 上生效**。原因：gfx950 上 async_copy 默认开启，pipeline 后全局加载变成 `AsyncCopyGlobalToLocalOp` 而非 `tt::LoadOp`。BlockPingpong 的通用路径（Four/Two/One PP Clusters）依赖 `gLoadOps`（`tt::LoadOp`），async copy 模式下 `gLoadOps` 为空→被拒绝。gfx950 上唯一能触发的标准 GEMM 路径是 `TwoClusterWithLocalLoadAndAll`，要求 `numStages==3`（非 2）。见 `mi355gemm_pingpong_learn.py`（128x128x64, num_stages=3）已验证触发。
 
 ### 外部仓库
 
