@@ -164,3 +164,201 @@ offset = splat(pid * 1024) + arange(0, 1024)
 - **Non-uniform**：来自 `tt.make_range`、`tt.load`（gather）等——每个 lane 不同，必须保留为 tensor
 
 pass 通过追踪值的定义链来判定 uniform/non-uniform。`tt.splat` 的输出是 uniform，`tt.make_range` 的输出是 non-uniform，`arith.addi(uniform, non-uniform)` 的结果是 non-uniform。
+
+## 源码 Walkthrough
+
+源码在 `third_party/amd/lib/TritonAMDGPUTransforms/CanonicalizePointers.cpp`（约 2000 行）。
+
+### 整体架构
+
+pass 使用 MLIR 的 **Dialect Conversion** 框架，把 tensor of pointers 这种"类型"转换为 (scalar base, tensor offset) 这种"类型对"。核心数据结构是 `FatPointers`（line 456），本质是一个 `DenseMap<(Value base, Value offset), FatPtrAttrs>`。
+
+### 入口: `runOnOperation`（line 1919）
+
+```cpp
+void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
+    FatPointers fatPtrs;
+
+    // 第 1 步: 初始化函数指针参数
+    // 对每个 tt.ptr 参数创建 FatPtr{base=arg, offset=0}
+    InitFuncPtrArgs pat(&getContext(), fatPtrs, enableLargeTensorPtrCanon);
+    pat.matchAndRewrite(func, rewriter);
+
+    // 第 2 步: 收集需要改写的 op（前向切片）
+    // 从每个指针参数出发，追踪所有传递使用
+    SetVector<Operation*> opsToRewrite;
+    for (auto arg : func.getArguments()) {
+        if (!isa<tt::PointerType>(arg.getType())) continue;
+        for (auto &use : arg.getUses())
+            getForwardSliceImpl(&use, use.getOwner(), &opsToRewrite);
+    }
+
+    // 第 3 步: 应用 conversion patterns
+    RewritePatternSet patterns;
+    patterns.add<ConvertSplatOp, ConvertAddPtrOp, ConvertSCFForOp,
+                 MaterializeFatPointer<tt::LoadOp>,
+                 MaterializeFatPointer<tt::StoreOp>, ...>(...);
+    applyPartialConversion(func, target, patterns);
+}
+```
+
+### 第 1 步: `InitFuncPtrArgs`（line 1675）
+
+为每个指针参数插入一个 `unrealized_conversion_cast`，建立 FatPtr 的初始映射。
+
+```cpp
+// 对于 %A: !tt.ptr<bf16> {tt.pointer_range = 32}
+Value zeroOffset = arith.constant 0 : i32;  // 32-bit（因为 pointer_range=32）
+auto dummyCast = unrealized_cast(%A, %zeroOffset) -> tt.ptr;
+// 所有 %A 的使用者现在看到的是 dummyCast 的结果
+// fatPtrs[{%A, %zeroOffset}] = {canNarrow=true, smallTensorBase=%A}
+```
+
+`pointer_range=32` 的参数用 32-bit offset（`i32`），否则用 64-bit（`i64`）。
+`smallTensorBase` 被设为原始参数 `%A`，后续 `ConvertAddPtrOp` 会使用不同的策略。
+
+### 第 2 步: `getForwardSliceImpl`（line 1862）
+
+从指针参数出发，沿着 use-def chain 向前追踪，收集所有涉及 pointer 的 op。
+
+```
+%A (tt.ptr) ──use──> tt.splat ──use──> tt.addptr ──use──> tt.load
+                                           │
+                                           └──use──> scf.for ──use──> tt.addptr ──use──> ...
+```
+
+特殊处理 `scf.for`（追踪 iter_args）、`scf.if`（追踪两个分支的 yield）、`cf.branch`（追踪 block args）。
+
+### 第 3 步: Conversion Patterns
+
+#### `ConvertSplatOp`（line 643）— splat 指针 → 保留 base，splat offset
+
+```
+输入:  tt.splat %fatPtr -> tensor<N x !tt.ptr>
+       其中 %fatPtr 已被拆为 (base, offset)
+
+输出:  base 不变，offset 被 splat
+       result = (base, tt.splat(offset))
+```
+
+关键代码（line 669-672）：
+```cpp
+tt::SplatOp offset = tt::SplatOp::create(rewriter, loc, newOffsetType, fatPtrOffset);
+rewriter.replaceOpWithMultiple(splatOp, {{fatPtrBase, offset}});
+```
+
+#### `ConvertAddPtrOp`（line 722）— 核心：分解 offset 为 uniform + non-uniform
+
+三种情况（line 765-839）：
+
+**情况 1: 标量指针更新**（line 766）
+```cpp
+// tt.addptr %scalar_ptr, %scalar_offset → 只更新 base
+if (isa<tt::PointerType>(addPtrOp.getPtr().getType())) {
+    auto newBase = tt.addptr(fatPtrBase, origOffset);  // 标量加法
+    result = (newBase, fatPtrOffset);  // offset 不变
+}
+```
+
+**情况 2: 常量 tensor offset**（line 783）
+```cpp
+// 整个 offset 是 splat(constant)，是 uniform 的
+if (auto scalarConst = maybeGetOrCreateScalarConstant(origOffset)) {
+    auto newBase = tt.addptr(fatPtrBase, scalarConst);  // 合并到 base
+    result = (newBase, fatPtrOffset);  // offset 不变
+}
+```
+
+**情况 3: 通用 tensor offset**（line 797）— 需要分解
+```cpp
+// 调用 createDecomposeOffsetFromExpr 递归分解
+auto [uniformOffset, nonUniformOffset] =
+    createDecomposeOffsetFromExpr(rewriter, loc, origOffset, bitness);
+
+// uniform 部分加到 base（标量运算）
+auto newBase = tt.addptr(fatPtrBase, uniformOffset);
+
+// non-uniform 部分加到 offset（tensor 运算）
+Value newOffset = arith.addi(fatPtrOffset, nonUniformOffset);
+
+result = (newBase, newOffset);
+```
+
+对于 `smallTensorBase` 非空的情况（即 `tt.pointer_range=32`），走 `rewriteSmallTensorPtr`（line 843），策略不同：不推进 base，而是把所有 offset 累加在一起保持 32-bit。
+
+#### `createDecomposeOffsetFromExpr`（line 384）— 递归分解 uniform/non-uniform
+
+这是分解算法的核心。递归遍历 offset 表达式树：
+
+```cpp
+// Base case 1: splat(scalar) → uniform=scalar, non-uniform=0
+if (auto scalarConst = maybeGetOrCreateScalarConstant(expr))
+    return {scalarConst, tensorZero};
+
+// Base case 2: block argument (tensor) → uniform=0, non-uniform=expr
+if (isa<BlockArgument>(expr))
+    return {scalarZero, expr};
+
+// Recursive: 按 op 类型分派
+TypeSwitch(expr.getDefiningOp())
+    .Case<arith::AddIOp>   → createDecomposeOffsetFromAdd   // (line 334)
+    .Case<arith::MulIOp>   → createDecomposeOffsetFromMul   // (line 355)
+    .Case<tt::BroadcastOp> → 递归分解 src，broadcast non-uniform 部分
+    .Case<tt::ExpandDimsOp>→ 递归分解 src，expand non-uniform 部分
+    .Default               → uniform=0, non-uniform=expr   // 无法分解
+```
+
+加法的分解（line 334）：
+```
+decompose(A + B) = { U(A) + U(B),  NU(A) + NU(B) }
+```
+
+乘法的分解（line 355）：
+```
+decompose(A * B) = { U(A) * U(B),  NU(A)*NU(B) + NU(B)*U(A) + U(A)*NU(B) }
+```
+
+举例：`offset = splat(pid * 1024) + make_range(0, 1024)`
+```
+decompose(splat(pid*1024))  = { pid*1024, tensor<0> }    // splat → 全 uniform
+decompose(make_range(0,1024)) = { 0, make_range(0,1024) } // make_range → 全 non-uniform
+decompose(add) = { pid*1024 + 0, tensor<0> + make_range(0,1024) }
+               = { pid*1024,     make_range(0,1024) }
+```
+
+#### `MaterializeFatPointer<tt::LoadOp>`（line 1592）— 在 load/store 处重组指针
+
+当遇到 `tt.load` 或 `tt.store` 时，需要把 `(base, offset)` 重新组装成 tensor of pointers：
+
+```cpp
+// 调用 createTensorPointer (line 556):
+Value ptr = tt.splat(base) : !tt.ptr -> tensor<N x !tt.ptr>
+Value result = tt.addptr(ptr, offset) : tensor<N x !tt.ptr>
+
+// 如果 canNarrow=true 且 offset 是 64-bit，先截断到 32-bit
+if (fatPtrAttrs.canNarrow && offset.bitwidth > 32)
+    offset = arith.trunci(offset, i32);
+```
+
+#### `ConvertSCFForOp`（line 1082）— 循环的 iter_args 拆分
+
+对于循环中传递的 tensor of pointers，需要把一个 iter_arg 拆成两个（base + offset）：
+
+```
+原始: scf.for ... iter_args(%ptr: tensor<N x !tt.ptr>)
+变换: scf.for ... iter_args(%base: !tt.ptr, %offset: tensor<N x i32>)
+```
+
+同时更新 `scf.yield` 将一个 yield 值拆成两个。
+
+### 运行测试
+
+```bash
+# 运行所有 CanonicalizePointers 测试
+<build_dir>/bin/triton-opt test/TritonGPU/amd/amd-canonicalize-pointers.mlir \
+    -tritonamdgpu-canonicalize-pointers -canonicalize -verify-diagnostics
+
+# 单独测试某个 case（用 split-input-file）
+<build_dir>/bin/triton-opt test/TritonGPU/amd/amd-canonicalize-pointers.mlir \
+    -split-input-file -tritonamdgpu-canonicalize-pointers -canonicalize
+```
