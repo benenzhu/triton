@@ -64,7 +64,7 @@ ScheduleLoops **不改变 IR 结构**，只给 op 添加属性标注：
 
 ### 为什么需要这一步
 
-Pipeline pass 本身是通用的（在 `lib/` 下而非 `third_party/amd/`），它不知道哪些 op 该提前执行。ScheduleLoops 作为 AMD 特定 pass，根据 CDNA 架构的延迟特征决定：
+ScheduleLoops 和 Pipeline 两个 pass 都注册在 AMD 目录下（`third_party/amd/lib/TritonAMDGPUTransforms/`），但 Pipeline 内部调用了 `lib/Dialect/TritonGPU/Transforms/Pipeliner/` 下的通用流水线展开基础设施（`tt::pipelineForLoop`、`tt::CoarseSchedule` 等）。职责分工：ScheduleLoops 决定**哪些 op 该提前执行**（根据 CDNA 架构延迟特征），Pipeline 负责**执行展开**：
 - memory ops（`tt.load`）延迟高 → 放到 stage 0，需要提前发射
 - compute ops（`tt.dot`）→ 放到 stage 1，消费前一次迭代 load 的数据
 
