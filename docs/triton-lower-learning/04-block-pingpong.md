@@ -48,8 +48,8 @@ Warp B: [===Memory===][===Dot===][===Memory===][===Dot===]
 ### 前提条件
 
 - 必须是**计算密集型**（compute-bound）的 kernel。如果是访存密集型，重叠计算没有意义
-- 需要 **Pipeline pass 已经执行**（`num_stages > 1`），用软件流水线隐藏 global memory 延迟
-- Pingpong 解决的是 **MFMA 与 LDS 访问之间的延迟**，而非 global memory 延迟
+- **BlockPingpong 在 Pipeline pass 之后执行**（`num_stages > 1`）。Pipeline 先完成软件流水线展开（双/三缓冲 LDS、async copy、prologue/epilogue），BlockPingpong 再在已展开的循环体上插入调度指令
+- Pingpong 解决的是 **MFMA 与 LDS 访问之间的延迟**，而非 global memory 延迟（global memory 延迟由 Pipeline 的软件流水线隐藏）
 
 ## 触发条件
 
